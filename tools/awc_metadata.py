@@ -1,4 +1,4 @@
-"""Read format metadata from an explicit little-endian ADAT sound-effect or music bank."""
+"""Read format metadata from an explicit little-endian ADAT or big-endian TADA sound-effect or music bank."""
 import argparse
 from dataclasses import asdict, dataclass
 import json
@@ -36,28 +36,32 @@ class Bank:
     music: Optional[MusicHeader]
 
 
-def _header(bank: PagedResource, size: int) -> tuple[int, int, int, list[int]]:
-    magic, flags, count, header_size = struct.unpack("<4sIII", bank.read(0, 16))
-    if magic != b"ADAT" or flags not in (0xff000001, 0xff020001):
-        raise ValueError("Expected little-endian ADAT v1 without indexing, streaming or encryption flags")
+BYTE_ORDERS = {b"ADAT": "<", b"TADA": ">"}  # the public reader switches its 16-, 32- and 64-bit header reads
+
+
+def _header(bank: PagedResource, size: int) -> tuple[int, int, int, list[int], str]:
+    order = BYTE_ORDERS.get(bank.read(0, 4))
+    flags, count, header_size = struct.unpack((order or "<") + "III", bank.read(4, 12))
+    if order is None or flags not in (0xff000001, 0xff020001):
+        raise ValueError("Expected an ADAT or TADA v1 bank without indexing, streaming or encryption flags")
     if not 1 <= count <= 4096:
         raise ValueError("AWC stream count outside the 1 to 4096 inventory limit")
     table = 16 + 4 * count
     if not table <= header_size <= size:
         raise ValueError("AWC stream table outside declared header")
-    entries = [word for word, in struct.iter_unpack("<I", bank.read(16, 4 * count))]
-    return count, table, header_size, entries
+    entries = [word for word, in struct.iter_unpack(order + "I", bank.read(16, 4 * count))]
+    return count, table, header_size, entries, order
 
 
 def read_formats(stream: BinaryIO, offset: int, size: int) -> list[FormatGroup]:
     bank = PagedResource(stream, [Segment(offset, size, size, "raw")])
-    count, table, header_size, entries = _header(bank, size)
+    count, table, header_size, entries, order = _header(bank, size)
     if entries[0] & 0x1fffffff == 0:
         raise ValueError("Streamed AWC banks are unsupported")
     table_bytes = 8 * sum(word >> 29 for word in entries)
     if table + table_bytes > header_size:
         raise ValueError("AWC tag table outside declared header")
-    tags = struct.iter_unpack("<Q", bank.read(table, table_bytes))
+    tags = struct.iter_unpack(order + "Q", bank.read(table, table_bytes))
     formats: list[tuple[int, int]] = []
     spans: list[tuple[int, int]] = []
     for entry in entries:
@@ -90,8 +94,8 @@ def read_formats(stream: BinaryIO, offset: int, size: int) -> list[FormatGroup]:
     for start, kind in formats:
         length, codec_offset = FORMAT_TAGS[kind]
         header = bank.read(start, length)
-        samples, = struct.unpack_from("<I", header)
-        rate, = struct.unpack_from("<H", header, 8)
+        samples, = struct.unpack_from(order + "I", header)
+        rate, = struct.unpack_from(order + "H", header, 8)
         codec = header[codec_offset]
         key = rate, codec
         if key not in groups:
@@ -101,7 +105,7 @@ def read_formats(stream: BinaryIO, offset: int, size: int) -> list[FormatGroup]:
     return [groups[key] for key in sorted(groups)]
 
 
-def _music(bank: PagedResource, size: int, table: int, header_size: int, entries: list[int]) -> Bank:
+def _music(bank: PagedResource, size: int, table: int, header_size: int, entries: list[int], order: str) -> Bank:
     # Only stream 0's tags are used, as in the reference; tags of streams 1.. are never read.
     if len(entries) > 32:
         raise ValueError("Music AWC bank has more than 32 streams")
@@ -113,7 +117,7 @@ def _music(bank: PagedResource, size: int, table: int, header_size: int, entries
     headers: list[int] = []
     data_tags = 0
     spans: list[tuple[int, int]] = []
-    for word, in struct.iter_unpack("<Q", bank.read(table, table_bytes)):
+    for word, in struct.iter_unpack(order + "Q", bank.read(table, table_bytes)):
         kind = word >> 56
         length = (word >> 28) & 0x0fffffff
         start = word & 0x0fffffff
@@ -133,7 +137,7 @@ def _music(bank: PagedResource, size: int, table: int, header_size: int, entries
         raise ValueError("Overlapping AWC tag extents")
     if header_length < 12:
         raise ValueError("AWC music header shorter than 12 bytes")
-    block_count, block_chunk, channels = struct.unpack("<III", bank.read(headers[0], 12))
+    block_count, block_chunk, channels = struct.unpack(order + "III", bank.read(headers[0], 12))
     if not 1 <= channels <= 32:
         raise ValueError("Music channel count outside 1 to 32")
     if header_length < 12 + 16 * channels:
@@ -145,8 +149,8 @@ def _music(bank: PagedResource, size: int, table: int, header_size: int, entries
         raise ValueError("Mixed codecs across music channels")
     groups: dict[tuple[int, int], FormatGroup] = {}
     for channel in range(channels):
-        samples, = struct.unpack_from("<I", records, 16 * channel + 4)
-        rate, = struct.unpack_from("<H", records, 16 * channel + 10)
+        samples, = struct.unpack_from(order + "I", records, 16 * channel + 4)
+        rate, = struct.unpack_from(order + "H", records, 16 * channel + 10)
         key = rate, records[16 * channel + 12]
         if key not in groups:
             groups[key] = FormatGroup(*key)
@@ -158,32 +162,39 @@ def _music(bank: PagedResource, size: int, table: int, header_size: int, entries
 
 def read_bank(stream: BinaryIO, offset: int, size: int) -> Bank:
     bank = PagedResource(stream, [Segment(offset, size, size, "raw")])
-    count, table, header_size, entries = _header(bank, size)
+    count, table, header_size, entries, order = _header(bank, size)
     if entries[0] & 0x1fffffff:
         return Bank("sfx", len(entries), read_formats(stream, offset, size), None)
-    return _music(bank, size, table, header_size, entries)
+    return _music(bank, size, table, header_size, entries, order)
 
 
 def integer(text: str) -> int:
     return int(text, 0)
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
-    parser.add_argument("--offset", type=integer, required=True, help="Byte offset of the ADAT header")
+    parser.add_argument("--offset", type=integer, required=True, help="Byte offset of the ADAT or TADA header")
     parser.add_argument("--size", type=integer, required=True, help="Bytes in the caller-supplied bank range")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if args.offset < 0:
+            raise ValueError(f"Expected non-negative --offset, got {args.offset}")
+        if args.size <= 0:
+            raise ValueError(f"Expected positive --size, got {args.size}")
+        if args.archive.is_dir():
+            raise ValueError(f"Archive path is a directory: {args.archive}")
         with args.archive.open("rb") as stream:
             bank = read_bank(stream, args.offset, args.size)
-    except (OSError, ValueError) as error:
-        parser.exit(1, f"{args.archive}: {error}\n")
+    except (OSError, ValueError, struct.error) as exc:
+        parser.exit(1, f"{type(exc).__name__}: {exc}\n")
     result: dict = {"stream_count": bank.stream_count}
     if bank.music:
         result |= {"layout": bank.layout, "music": asdict(bank.music)}
     print(json.dumps(result | {"formats": [asdict(g) for g in bank.formats]}))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

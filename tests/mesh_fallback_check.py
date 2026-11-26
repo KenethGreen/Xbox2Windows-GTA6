@@ -67,25 +67,32 @@ def indexed_fixture(case, point_depth=0.0625, matrix_depth=0.125):
     return fallback_fixture(constants, positions, pixels)
 
 
-def draw(renderer, adapter, directory, shaders, label, data, *, bad_pixels=None, bad_export=None):
+def draw(renderer, adapter, directory, shaders, label, data, *, bad_pixels=None, bad_export=None, textured=False):
     path = directory / (label + ".case")
     path.write_bytes(data)
     print(label, flush=True)
-    command = [renderer, adapter, "--mesh-indexed-fallback", *shaders, path]
-    if bad_pixels is None:
-        result = subprocess.run(command)
+    operation = "--mesh-textured-fallback" if textured else "--mesh-indexed-fallback"
+    command = [renderer, adapter, operation, *shaders, path]
+    negative = bad_pixels is not None
+    result = subprocess.run(command, capture_output=textured or negative, text=True)
+    if result.stdout is not None:
+        print(result.stdout, end="")
+        print(result.stderr, end="")
+    if not negative:
         if result.returncode == 77:
             sys.exit(77)
         result.check_returncode()
-        return
-    result = subprocess.run(command, capture_output=True, text=True)
-    print(result.stdout, end="")
-    print(result.stderr, end="")
-    error = "Mesh export trace mismatch" if bad_export is not None else "Draw reference mismatch"
+        if not textured:
+            return
     lines = result.stdout.splitlines()
     if (f"backend={adapter} debug_layer=unavailable" not in lines
             and "debug_errors=0 debug_warnings=0" not in lines):
-        raise AssertionError("Negative control did not finish with a clean D3D12 debug layer")
+        raise AssertionError(f"{label} did not finish with a clean D3D12 debug layer")
+    if not negative:
+        if "mesh_exports bytes=128 matched=1" not in lines or "pixels=1024 mismatches=0" not in lines:
+            raise AssertionError(f"{label} did not match the export and pixel references")
+        return
+    error = "Mesh export trace mismatch" if bad_export is not None else "Draw reference mismatch"
     if (
         result.returncode != 1
         or f"pixels=1024 mismatches={bad_pixels}" not in lines
